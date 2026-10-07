@@ -1,0 +1,172 @@
+name: wager
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://wager:wager@postgres:5432/wager?sslmode=disable
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  # O issuer é a URL pública do Keycloak (a mesma que aparece no claim "iss");
+  # as chaves são buscadas pela rede interna do compose.
+  AUTH_ISSUER: http://localhost:8080/realms/wager
+  AUTH_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
+  HTTP_ADDR: ":8080"
+  # Rastreamento OpenTelemetry (OTLP/HTTP) para o Jaeger; UI em http://localhost:16686
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+  OTEL_SERVICE_NAME: wager-service
+
+x-app: &app
+  build:
+    context: .
+    target: server
+  environment: *app-env
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    keycloak:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+    jaeger:
+      condition: service_started
+  restart: unless-stopped
+  stop_grace_period: 40s
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI e API de consulta
+      - "4318:4318"     # OTLP/HTTP
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wager
+      POSTGRES_PASSWORD: wager
+      POSTGRES_DB: wager
+    ports:
+      - "5432:5432"
+    command: ["postgres", "-c", "max_connections=300"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wager -d wager"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: http://localhost:8080
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/keycloak/realm-wager.json:/opt/keycloak/data/import/realm-wager.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: sqs
+      DEBUG: "0"
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./deploy/localstack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/queues-ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  migrate:
+    build:
+      context: .
+      target: migrate
+    environment:
+      DATABASE_URL: postgres://wager:wager@postgres:5432/wager?sslmode=disable
+    command: ["up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Três instâncias independentes, cada uma com suas conexões e workers.
+  app1:
+    <<: *app
+    ports:
+      - "8081:8080"
+  app2:
+    <<: *app
+    ports:
+      - "8082:8080"
+  app3:
+    <<: *app
+    ports:
+      - "8083:8080"
+
+  # Emulador que IMPÕE políticas IAM (o LocalStack comunitário não impõe). Usado só pelo
+  # teste de menor privilégio do broker (TestBrokerAccessIsLeastPrivilege).
+  iam-broker:
+    profiles: ["test"]
+    image: motoserver/moto:latest
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:5000/moto-api/')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # Testes de integração: rodam dentro da rede do compose contra a infraestrutura real.
+  # Uso: docker compose --profile test run --rm tests
+  tests:
+    profiles: ["test"]
+    image: golang:1.27.1
+    working_dir: /src
+    volumes:
+      - .:/src
+      - gomodcache:/go/pkg/mod
+      - gobuildcache:/root/.cache/go-build
+      - /var/run/docker.sock:/var/run/docker.sock # somente para o teste de queda do PostgreSQL parar/religar o container
+    environment:
+      GOFLAGS: -buildvcs=false
+      TEST_DATABASE_URL: postgres://wager:wager@postgres:5432/wager?sslmode=disable
+      TEST_AWS_ENDPOINT_URL: http://localstack:4566
+      TEST_AUTH_TOKEN_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/token
+      TEST_DOCKER_SOCKET: /var/run/docker.sock
+      TEST_POSTGRES_CONTAINER: wager-postgres-1
+      TEST_AUTH_ISSUER: http://localhost:8080/realms/wager
+      TEST_AUTH_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
+      TEST_OTLP_ENDPOINT: http://jaeger:4318
+      TEST_JAEGER_URL: http://jaeger:16686
+      TEST_IAM_ENDPOINT: http://iam-broker:5000
+    depends_on:
+      iam-broker:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    command: ["go", "test", "-race", "-count=1", "-tags", "integration", "-timeout", "30m", "./test/integration/..."]
+
+volumes:
+  gomodcache:
+  gobuildcache:

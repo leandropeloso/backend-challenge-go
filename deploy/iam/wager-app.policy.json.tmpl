@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConsumeOperationRequests",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": "${WAGER_QUEUE_ARN}"
+    },
+    {
+      "Sid": "SendToDeadLetterQueue",
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueUrl", "sqs:SendMessage"],
+      "Resource": "${DLQ_ARN}"
+    },
+    {
+      "Sid": "PublishIntegrationEvents",
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueUrl", "sqs:SendMessage"],
+      "Resource": "${EVENTS_QUEUE_ARN}"
+    }
+  ]
+}
