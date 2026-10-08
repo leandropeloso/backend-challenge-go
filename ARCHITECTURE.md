@@ -1,7 +1,7 @@
 # Arquitetura e decisões
 
-Este documento registra as decisões técnicas, as interpretações adotadas e o que ficou de fora.
-O enunciado está em [DESAFIO.md](DESAFIO.md); a execução, em [README.md](README.md).
+Aqui estão as decisões técnicas que tomei, como interpretei os pontos em aberto do enunciado e o que
+ficou de fora. O enunciado está em [DESAFIO.md](DESAFIO.md); como executar, no [README.md](README.md).
 
 ## Visão geral
 
@@ -63,7 +63,7 @@ que a transação seja realmente desfeita quando o contexto cancela).
 
 ## Carteira e concorrência
 
-A carteira é a raiz do agregado: `id`, `playerId`, `balance`, `version` (começa em 1 e só avança
+A carteira é a raiz do agregado e guarda `id`, `playerId`, `balance`, `version` (começa em 1 e só avança
 quando o saldo muda), timestamps. `Debit`/`Credit` exigem valor positivo e da mesma moeda; o débito
 recusa saldo negativo. A carteira devolve um `Movement` que a aplicação transforma em lançamento de
 ledger e evento.
@@ -201,7 +201,7 @@ reinícios, pois o agendamento é durável no banco. A pendência termina quando
 
 ## Idempotência
 
-Persistente, no PostgreSQL, e independente de memória, locks locais ou da deduplicação do SQS FIFO.
+Fica toda no PostgreSQL; não depende de memória, de locks locais nem da deduplicação do SQS FIFO.
 
 - `UNIQUE (provider_id, idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)`. O
   escopo é por provedor: a chave de um provedor nunca produz replay para outro.
@@ -385,8 +385,8 @@ O ledger usa cursor opaco (`base64url({"v":<wallet_version>})`) e ordena por `wa
 Logs JSON (`slog`) com `correlationId` (header `X-Correlation-Id` ou `messageId`), `messageId`,
 `transactionId`, `walletId` e `providerId`; não registram credenciais nem corpos financeiros.
 Métricas Prometheus por resultado/status/código, duplicatas, retries, DLQ, conflitos de
-concorrência, atraso e fila da outbox, latência e divergências de reconciliação (listadas no
-README). Reconciliação: reconstrói o saldo a partir do ledger (inclui a abertura), devolve
+concorrência, atraso e fila da outbox, latência e divergências de reconciliação (nomes `wager_*` em `internal/infra/observability/metrics.go`).
+A reconciliação reconstrói o saldo a partir do ledger (inclui a abertura), devolve
 `difference = armazenado − reconstruído`, e divergências viram resposta, log e métrica sem alterar
 o saldo. Health: `/health/live` (processo) e `/health/ready` (PostgreSQL, SQS, chaves do IdP).
 
@@ -406,7 +406,7 @@ encerra o provider por último (flush dos spans pendentes). Os logs trazem o `tr
   configuração, codec JSON, cursor, validação JWT com JWKS real gerado no teste e middleware.
 - **Integração** (`test/integration`, tag `integration`): PostgreSQL, Keycloak e LocalStack
   reais; processos independentes do servidor, compilados com `-race`; sem substituir
-  infraestrutura por mocks. Lista de cenários no README.
+  infraestrutura por mocks. Os cenários estão em `test/integration`.
 - **Ponta a ponta** (`scripts/e2e.ps1`): a jornada completa pelas três instâncias do Compose.
 - **Fuzz** do parser monetário (`FuzzParse`) e **carga** reproduzível (`cmd/loadtest`), que ao final
   reconcilia todas as carteiras.
@@ -425,22 +425,22 @@ encerra o provider por último (flush dos spans pendentes). Os logs trazem o `tr
 - **`WIN`/`LOSS` com referência** (opcional): seguem o mesmo mecanismo de espera das reversões
   (ficam pendentes se a aposta ainda não chegou) e a referência precisa ser uma `BET`.
 - **Ordem da outbox**: garantida por carteira. As reservas dos relays são serializadas por um
-  `pg_advisory_xact_lock` curto (a seleção e o `UPDATE` rodam numa transação de milissegundos): sem
-  ele, dois relays com snapshots diferentes podiam reservar eventos *posteriores* de uma carteira
-  enquanto outro segurava os anteriores (ver `AUDITORIA.md`, defeito 7). O
-  lock não afeta o processamento das carteiras nem a publicação. Mesmo assim o payload traz
-  `walletVersion`, e os consumidores devem ser idempotentes por `eventId` (uma republicação fora da
-  janela de 5 min do broker é entregue de novo). Um evento "venenoso" nunca é descartado e segura os
-  posteriores da mesma carteira.
+  `pg_advisory_xact_lock` curto (a seleção e o `UPDATE` rodam numa transação de milissegundos). Sem
+  ele, dois relays com snapshots diferentes podiam reservar eventos posteriores de uma carteira
+  enquanto outro segurava os anteriores; isso apareceu no teste de carga aleatória. O lock não afeta
+  o processamento das carteiras nem a publicação. O payload também traz `walletVersion`, e os
+  consumidores devem ser idempotentes por `eventId` (uma republicação fora da janela de 5 min do
+  broker é entregue de novo). Um evento "venenoso" nunca é descartado e segura os posteriores da
+  mesma carteira.
 - **Transação pendente que falha sempre** (ex.: dado inconsistente): ao retomá-la, um erro não
   transitório gera backoff nela e, no limite de tentativas, `FAILED/INTERNAL_ERROR` auditável, em
   vez de monopolizar o worker (ela seria sempre a mais antiga da fila).
 - Não há limpeza/arquivamento de eventos publicados na outbox (a tabela só cresce).
 - `/metrics` e `/health/*` são públicos (esperado atrás da rede interna); não há TLS na aplicação.
-- Chaves do realm de teste (secrets em texto no JSON) são só para o ambiente local.
-- **Não feitos**: dashboards (opcionais no enunciado). Partidas dobradas, tracing OpenTelemetry e
-  teste de carga existem (ver README). Múltiplas moedas foram modeladas, mas só BRL é exercitado
-  nos cenários principais; o balancete e o diário já são por moeda.
+- Os secrets do realm de teste estão em texto no JSON; servem só para o ambiente local.
+- **Não feito**: dashboards (opcionais no enunciado). Partidas dobradas, tracing OpenTelemetry e
+  teste de carga existem. Várias moedas foram modeladas, mas só BRL é exercitado nos
+  cenários principais; o balancete e o diário já são por moeda.
 - **Broker em produção**: as políticas IAM de `deploy/iam` foram verificadas contra um emulador que
   as impõe (Moto), não contra a AWS real; política de recurso nas filas, SSE e credenciais
   temporárias por papel ficam por conta do ambiente.
